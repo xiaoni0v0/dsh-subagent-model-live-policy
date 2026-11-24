@@ -83,8 +83,14 @@ function freshOtherDefinition() {
 }
 
 /**
- * A stand-in for the real tool registry: `schemas` is a prototype method that
- * re-projects the registered definitions on every call, exactly as DSH's does.
+ * A stand-in for the real tool registry. It mirrors the two methods DSH derives
+ * the model-facing list from:
+ *
+ *  - `definitions()` returns a fresh array of the shared definition objects.
+ *  - `schemas()` projects those definitions, like `projectToolSchema`.
+ *
+ * `describe()` mirrors the native executor's own path, which projects the
+ * definitions it is handed rather than calling `schemas()`.
  */
 function FakeToolRegistry() {
   this.visible = []
@@ -96,8 +102,14 @@ FakeToolRegistry.prototype.register = function register(definition) {
     if (index >= 0) this.visible.splice(index, 1)
   }
 }
+FakeToolRegistry.prototype.definitions = function definitions() {
+  return [...this.visible]
+}
 FakeToolRegistry.prototype.schemas = function schemas() {
-  return this.visible.map(({ name, description, parameters }) => ({ name, description, parameters }))
+  return this.definitions().map(({ name, description, parameters }) => ({ name, description, parameters }))
+}
+FakeToolRegistry.prototype.describe = function describe(list) {
+  return { schemas: list.map(({ name, description, parameters }) => ({ name, description, parameters })) }
 }
 
 /**
@@ -248,6 +260,31 @@ async function mountPlugin(ctx) {
   check('unrelated tools are untouched', byName.get('read').description === 'Read a file.')
   check('the hint discourages guessing the vendor name', byName.get('subagent').description.includes('not be named after the vendor'))
   check('the hint names the always-safe omission', byName.get('subagent').description.includes('Omitting all three route fields'))
+  await ctx.fiber.dispose()
+}
+
+// ---- 10b: the native executor path sees the hint too -------------------
+{
+  // The stock native executor builds the model-facing list from
+  // `definitions()`, never from `schemas()`; wrapping only `schemas()` left the
+  // model with the stock wording while an inspect query looked correct.
+  const tools = new FakeToolRegistry()
+  tools.visible.push(
+    { name: 'subagent', description: 'Delegate a self-contained task.', parameters: { type: 'object' } },
+    { name: 'read', description: 'Read a file.', parameters: { type: 'object' } },
+  )
+  const { ctx } = await harness({ service: policyService(true, [{ provider: 'xai', model: 'grok-4.7' }]), tools })
+  await mountPlugin(ctx)
+
+  const viaNative = tools.describe(tools.definitions())
+  const byName = new Map(viaNative.schemas.map(schema => [schema.name, schema]))
+  check('the native executor path carries the hint', byName.get('subagent').description.includes('list_subagent_models'))
+  check('the native path leaves other tools alone', byName.get('read').description === 'Read a file.')
+
+  // The registered definitions must stay pristine: `resolve()` compares them by
+  // identity against `view()`, so mutating them in place would break admission.
+  const registered = tools.visible.find(definition => definition.name === 'subagent')
+  check('the stored definition is not mutated', registered.description === 'Delegate a self-contained task.')
   await ctx.fiber.dispose()
 }
 

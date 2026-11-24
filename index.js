@@ -162,24 +162,38 @@ const DISCOVERY_HINT = ' Before passing `provider` or `model`, call `list_subage
   + ' always works and inherits the parent route.'
 
 /**
- * Append the discovery hint to a delegation tool's schema, once.
- * @param schema - projected model-facing schema.
- * @returns the schema, possibly with an amended description.
+ * Append the discovery hint to a delegation tool's description, once.
+ * Works on a registered ToolDefinition and on a projected ToolSchema alike:
+ * both carry `name` and `description`, and neither needs anything else touched.
+ * @param entry - definition or projected schema.
+ * @returns the entry, possibly with an amended description.
  */
-function withDiscoveryHint(schema) {
-  if (!DELEGATION_TOOLS.has(schema?.name)) return schema
-  if (typeof schema.description !== 'string' || schema.description.includes('list_subagent_models')) {
-    return schema
+function withDiscoveryHint(entry) {
+  if (!DELEGATION_TOOLS.has(entry?.name)) return entry
+  if (typeof entry.description !== 'string' || entry.description.includes('list_subagent_models')) {
+    return entry
   }
-  return { ...schema, description: schema.description + DISCOVERY_HINT }
+  return { ...entry, description: entry.description + DISCOVERY_HINT }
 }
 
 /**
  * Teach the delegation tools to discover routes before guessing them.
  *
- * `schemas()` is a prototype method that re-projects every visible definition on
- * each call, so wrapping it reaches every model-facing tool list while leaving
- * the registered definitions, execution, and presentation untouched.
+ * Two methods have to be wrapped, because DSH derives the model-facing list from
+ * one of them depending on the executor:
+ *
+ *  - `definitions()` feeds `executor.describe()`, which the native executor turns
+ *    into schemas with its own `projectToolSchema` call. This is what the model
+ *    actually sees on a stock profile, and it never reaches `schemas()`.
+ *  - `schemas()` is the projection PTC and the Cordis inspect surface read.
+ *
+ * Wrapping only `schemas()` looked correct through an inspect query while the
+ * model still saw the stock wording. Both are wrapped now.
+ *
+ * `definitions()` returns a fresh array of shared definition objects on every
+ * call, so replacing elements with `{ ...entry, description }` leaves the
+ * registry's stored definitions — and the `view()` identity checks in
+ * `resolve()` — untouched.
  * @param ctx - plugin context carrying the tool registry.
  * @param release - installs one counted patch and returns its release.
  * @returns whether the projection is now hinted, plus a diagnostic.
@@ -190,14 +204,27 @@ function installDiscoveryHint(ctx, release) {
     return { hinted: false, reason: 'the tools service is unavailable' }
   }
   const proto = Object.getPrototypeOf(tools)
-  if (proto === null || !Object.hasOwn(proto, 'schemas')) {
-    return { hinted: false, reason: 'the tool registry no longer owns a schemas method' }
+  if (proto === null) {
+    return { hinted: false, reason: 'the tool registry has no prototype' }
   }
-  release(patchProto(proto, 'schemas', (original) => function schemas(scope, toolSet) {
-    const projected = original.call(this, scope, toolSet)
-    return Array.isArray(projected) ? projected.map(withDiscoveryHint) : projected
-  }))
-  return { hinted: true, reason: 'installed' }
+  const wrap = (method) => {
+    if (!Object.hasOwn(proto, method)) return false
+    release(patchProto(proto, method, (original) => function patched(scope, toolSet) {
+      const list = original.call(this, scope, toolSet)
+      return Array.isArray(list) ? list.map(withDiscoveryHint) : list
+    }))
+    return true
+  }
+  const definitions = wrap('definitions')
+  const schemas = wrap('schemas')
+  if (!definitions && !schemas) {
+    return { hinted: false, reason: 'the tool registry owns neither definitions nor schemas' }
+  }
+  return {
+    hinted: true,
+    reason: definitions && schemas ? 'installed on definitions and schemas'
+      : definitions ? 'installed on definitions only' : 'installed on schemas only',
+  }
 }
 
 /**
