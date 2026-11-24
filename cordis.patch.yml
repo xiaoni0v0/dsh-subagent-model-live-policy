@@ -1,0 +1,10 @@
+# dsh-subagent-model-live-policy bundle layer.
+#
+# `name` must stay the full package name: the client-modules registry resolves
+# the browser bundle by the loader entry name.
+#
+# `insert` is required: a patch without `insert` overrides an EXISTING entry by
+# id, and an unknown id is skipped with only a log line.
+- insert:
+    - id: subagent-model-live-policy
+      name: 'dsh-subagent-model-live-policy'

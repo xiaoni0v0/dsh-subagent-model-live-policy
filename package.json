@@ -1,0 +1,37 @@
+{
+  "name": "dsh-subagent-model-live-policy",
+  "version": "1.0.0",
+  "description": "Read the subagent model allowlist live from Settings, so turning it on, off, or changing it applies immediately, and teach the delegation tools to discover routes before guessing them",
+  "type": "module",
+  "main": "./index.js",
+  "exports": {
+    ".": "./index.js",
+    "./package.json": "./package.json",
+    "./cordis.patch.yml": "./cordis.patch.yml"
+  },
+  "files": [
+    "index.js",
+    "cordis.patch.yml",
+    "README.md",
+    "LICENSE"
+  ],
+  "license": "MIT",
+  "keywords": [
+    "dsh",
+    "deepseek-harness",
+    "cordis",
+    "subagent",
+    "plugin"
+  ],
+  "engines": {
+    "node": ">=22"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "scripts": {
+    "test": "node test.mjs"
+  }
+}
