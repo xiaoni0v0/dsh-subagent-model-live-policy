@@ -62,6 +62,17 @@ subscription plugin.
 - If DSH renames `cellFor` or `schemas`, the plugin detects the mismatch, logs
   why it is inactive, and changes nothing.
 
+## How the patching stays safe
+
+Both patches are reference-counted. During HMR the incoming fiber mounts before
+the outgoing one disposes, so two instances legitimately overlap; each holds a
+reference and the original method is restored only when the last one releases.
+Without the count, the first disposal would strip the patch while the survivor
+still believed it was installed.
+
+Both patches are owned by one effect, so disposal releases them in reverse order
+and never leaves a half-patched prototype.
+
 ## Limits that remain
 
 - Turning the setting **off** stops granting authorization; it does not erase a

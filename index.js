@@ -34,14 +34,53 @@
 /** Projection key owned by `@deepseek-ai/dsh-tool-subagent`. */
 const PROJECTION_KEY = 'subagentModelSelectionPolicy'
 
-/** Marks a prototype that already carries this patch, and holds the original. */
+/** Marks a prototype carrying this patch: `{ original, patched, refs }`. */
 const PATCH_MARK = Symbol.for('dsh.subagent-model-live-policy')
 
 /** Cordis plugin name shown in loader diagnostics. */
 export const name = 'subagent-model-live-policy'
 
-/** The registry whose read path is patched. */
-export const inject = ['sessionProjections']
+/**
+ * The registry whose read path is patched. `tools` is required so the schema
+ * hint installs only once both services exist, rather than racing them.
+ */
+export const inject = ['sessionProjections', 'tools']
+
+/**
+ * Install one prototype method patch, reference-counted.
+ *
+ * A second instance must not assume the first one's patch outlives it: during
+ * HMR the old fiber disposes after the new one mounts, so a naive "already
+ * patched" early return would leave the survivor believing it is patched while
+ * the patch is gone. Each participant therefore holds a reference, and the
+ * original is restored only when the last one releases.
+ * @param proto - prototype owning the method.
+ * @param method - method name to wrap.
+ * @param factory - builds the replacement from the current original.
+ * @returns a release function.
+ */
+function patchProto(proto, method, factory) {
+  let entry = proto[PATCH_MARK]
+  if (entry === undefined) {
+    entry = { original: proto[method], patched: undefined, refs: 0 }
+    Object.defineProperty(proto, PATCH_MARK, { value: entry, configurable: true })
+  }
+  if (entry.refs === 0) {
+    entry.original = proto[method]
+    entry.patched = factory(entry.original)
+    proto[method] = entry.patched
+  }
+  entry.refs += 1
+  let released = false
+  return () => {
+    if (released) return
+    released = true
+    entry.refs -= 1
+    if (entry.refs > 0) return
+    if (proto[method] === entry.patched) proto[method] = entry.original
+    delete proto[PATCH_MARK]
+  }
+}
 
 /** Read a Schemastery volatile reference, or a plain value. */
 function readValue(reference) {
@@ -68,9 +107,10 @@ function liveRoutes(ctx) {
 /**
  * Install the live read path on the projection registry's prototype.
  * @param ctx - plugin context carrying `sessionProjections`.
+ * @param release - installs one counted patch and returns its release.
  * @returns whether the read path is now live, plus a diagnostic.
  */
-function installLiveRead(ctx) {
+function installLiveRead(ctx, release) {
   const registry = ctx.sessionProjections
   if (registry === undefined || registry === null) {
     return { live: false, reason: 'the sessionProjections service is unavailable' }
@@ -81,9 +121,7 @@ function installLiveRead(ctx) {
   if (proto === null || !Object.hasOwn(proto, 'cellFor')) {
     return { live: false, reason: 'the projection registry no longer owns a cellFor method' }
   }
-  if (proto[PATCH_MARK] !== undefined) return { live: true, reason: 'already live' }
-  const original = proto.cellFor
-  const patched = function cellFor(registration, session) {
+  release(patchProto(proto, 'cellFor', (original) => function cellFor(registration, session) {
     const cell = original.call(this, registration, session)
     if (registration?.def?.key !== PROJECTION_KEY) return cell
     let live
@@ -98,15 +136,7 @@ function installLiveRead(ctx) {
     // state for this read only, leaving the cached cell and the log untouched.
     if (live === undefined) return cell
     return { ...cell, state: live }
-  }
-  ctx.effect(() => {
-    Object.defineProperty(proto, PATCH_MARK, { value: { original, patched }, configurable: true })
-    proto.cellFor = patched
-    return () => {
-      if (proto.cellFor === patched) proto.cellFor = original
-      delete proto[PATCH_MARK]
-    }
-  }, 'subagent-model-live-policy: cellFor')
+  }))
   return { live: true, reason: 'installed' }
 }
 
@@ -151,9 +181,10 @@ function withDiscoveryHint(schema) {
  * each call, so wrapping it reaches every model-facing tool list while leaving
  * the registered definitions, execution, and presentation untouched.
  * @param ctx - plugin context carrying the tool registry.
+ * @param release - installs one counted patch and returns its release.
  * @returns whether the projection is now hinted, plus a diagnostic.
  */
-function installDiscoveryHint(ctx) {
+function installDiscoveryHint(ctx, release) {
   const tools = ctx.get('tools')
   if (tools === undefined || tools === null) {
     return { hinted: false, reason: 'the tools service is unavailable' }
@@ -162,29 +193,28 @@ function installDiscoveryHint(ctx) {
   if (proto === null || !Object.hasOwn(proto, 'schemas')) {
     return { hinted: false, reason: 'the tool registry no longer owns a schemas method' }
   }
-  if (proto[SCHEMAS_MARK] !== undefined) return { hinted: true, reason: 'already hinted' }
-  const original = proto.schemas
-  const patched = function schemas(scope, toolSet) {
+  release(patchProto(proto, 'schemas', (original) => function schemas(scope, toolSet) {
     const projected = original.call(this, scope, toolSet)
     return Array.isArray(projected) ? projected.map(withDiscoveryHint) : projected
-  }
-  ctx.effect(() => {
-    Object.defineProperty(proto, SCHEMAS_MARK, { value: { original, patched }, configurable: true })
-    proto.schemas = patched
-    return () => {
-      if (proto.schemas === patched) proto.schemas = original
-      delete proto[SCHEMAS_MARK]
-    }
-  }, 'subagent-model-live-policy: schemas')
+  }))
   return { hinted: true, reason: 'installed' }
 }
 
 /**
  * Mount the live read path and the delegation discovery hint.
+ *
+ * Both patches are owned by one effect so a disposal releases them in reverse
+ * order and leaves no half-patched prototype behind.
  * @param ctx - plugin context.
  */
 export function apply(ctx) {
-  const result = installLiveRead(ctx)
+  const releases = []
+  const release = (fn) => { releases.push(fn) }
+  ctx.effect(() => () => {
+    for (const fn of releases.splice(0).reverse()) fn()
+  }, 'subagent-model-live-policy: patches')
+
+  const result = installLiveRead(ctx, release)
   if (result.live) {
     ctx.logger.info('subagent-model-live-policy: the subagent allowlist is read live from Settings (%s)', result.reason)
   } else {
@@ -193,7 +223,7 @@ export function apply(ctx) {
       result.reason,
     )
   }
-  const hint = installDiscoveryHint(ctx)
+  const hint = installDiscoveryHint(ctx, release)
   if (!hint.hinted) {
     ctx.logger.warn(
       'subagent-model-live-policy: delegation tools keep their stock description — %s',

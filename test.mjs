@@ -9,7 +9,7 @@
  */
 
 const ASAR = 'file:///C:/Users/XN/AppData/Local/Programs/DeepSeek%20Harness/resources/app.asar/dsh/node_modules/@deepseek-ai/'
-const PLUGIN = 'file:///C:/Users/XN/AppData/Local/Programs/DeepSeek%20Harness/resources/dsh-local/subagent-model-live-policy/index.js'
+const PLUGIN = new URL('./index.js', import.meta.url).href
 
 const { Context } = await import(ASAR + 'cordis/lib/index.js')
 const { SessionProjectionRegistry } = await import(ASAR + 'dsh-session-projection/lib/index.js')
@@ -273,7 +273,39 @@ async function mountPlugin(ctx) {
   await fiber.dispose()
   await new Promise(resolve => setTimeout(resolve, 60))
   check('disposing restores the stock description', tools.schemas()[0].description === 'Delegate.')
-  check('the schemas mark is gone', Object.getPrototypeOf(tools)[Symbol.for('dsh.subagent-model-live-policy.schemas')] === undefined)
+  check('the schemas mark is gone', Object.getPrototypeOf(tools)[Symbol.for('dsh.subagent-model-live-policy')] === undefined)
+}
+
+// ---- 13: two mounted instances share one patch, and the last release wins --
+{
+  const tools = new FakeToolRegistry()
+  tools.visible.push({ name: 'subagent', description: 'Delegate.', parameters: { type: 'object' } })
+  const session = fakeSession('s13', [{ type: POLICY_EVENT, data: { allowedModels: [{ provider: 'old', model: 'm' }] } }])
+  const { ctx, registry, policyHandle } = await harness({
+    service: policyService(true, [{ provider: 'xai', model: 'grok-4.7' }]), session, tools,
+  })
+  // Two fibers of the same plugin, as HMR briefly produces.
+  const first = ctx.plugin(plugin)
+  const second = ctx.plugin(plugin)
+  await new Promise(resolve => setTimeout(resolve, 80))
+
+  const proto = Object.getPrototypeOf(registry)
+  const entry = proto[Symbol.for('dsh.subagent-model-live-policy')]
+  check('both instances share one counted patch', entry?.refs === 2, `refs=${entry?.refs}`)
+  check('the read path is live with both mounted', policyHandle.stateOf(session)?.[0]?.provider === 'xai', JSON.stringify(policyHandle.stateOf(session)))
+
+  // Disposing one must leave the other working — the bug the counter fixes.
+  await first.dispose()
+  await new Promise(resolve => setTimeout(resolve, 80))
+  check('one disposal keeps the patch alive for the survivor', policyHandle.stateOf(session)?.[0]?.provider === 'xai', JSON.stringify(policyHandle.stateOf(session)))
+  check('the survivor still holds a reference', Object.getPrototypeOf(registry)[Symbol.for('dsh.subagent-model-live-policy')]?.refs === 1)
+  check('the hint survives too', tools.schemas()[0].description.includes('list_subagent_models'))
+
+  await second.dispose()
+  await new Promise(resolve => setTimeout(resolve, 80))
+  check('the last disposal restores the recorded policy', policyHandle.stateOf(session)?.[0]?.provider === 'old', JSON.stringify(policyHandle.stateOf(session)))
+  check('the mark is gone after the last release', Object.getPrototypeOf(registry)[Symbol.for('dsh.subagent-model-live-policy')] === undefined)
+  check('the stock description is back', tools.schemas()[0].description === 'Delegate.')
 }
 
 for (const { label, ok, detail } of results) {
