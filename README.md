@@ -1,106 +1,72 @@
 # dsh-subagent-model-live-policy
 
-Make the subagent model allowlist live, and teach the delegation tools how to
-discover routes instead of guessing them.
+让 subagent 的模型白名单实时生效，并让派发工具学会先查清单。
 
-Two independent problems, one small plugin:
+解决两个独立的问题，一个很小的插件。
 
-## 1. A Settings change reaches only new Sessions
+## 一、设置改了只对新会话生效
 
-DSH records the child-LLM allowlist as a Session event
-(`subagent/model-selection-policy`) when an Agent is created, and its projection
-fold accepts only the **first** such event. Changing the allowlist in Settings
-therefore reaches only Sessions created afterwards: the Settings page shows the
-new list while `subagent(provider, model)` keeps rejecting routes that are now
-listed, and keeps accepting routes that were removed.
+DSH 在创建 Agent 时把子模型白名单记成一条会话事件（`subagent/model-selection-policy`），而它的投影只认**第一条**。所以设置页改了白名单，只有之后新建的会话能拿到：界面显示的是新列表，`subagent(provider, model)` 却还在拒绝新加的、还在接受删掉的。
 
-Appending more events does not fix this. The projection state is a non-empty
-route array or `null`, and the Session-format validator rejects an empty
-`allowedModels`, so "the list is now empty" cannot be written at all.
+再追加事件修不了。投影状态只能是「非空路由数组」或 `null`，而会话格式校验又不接受空的 `allowedModels`，所以「列表变空」这件事根本写不进去。
 
-Instead, this plugin overrides the single read path both consumers already use.
-`subagent` and `list_subagent_models` read the allowlist through
-`ProjectionHandle.stateOf(session)`, which is:
+这个插件改成覆盖**唯一的读取路径**。`subagent` 和 `list_subagent_models` 都是通过 `ProjectionHandle.stateOf(session)` 读白名单的，而它内部就是：
 
 ```js
 stateOf: session => this.cellFor(registration, session).state
 ```
 
-`cellFor` is a prototype method on the projection registry. Wrapping it once,
-filtered by projection key, makes both consumers read the live preference on
-every call, leaving the Session log, the fold, and the format validator
-untouched.
+`cellFor` 是投影注册表原型上的方法。按投影 key 过滤后包一层，两个消费者每次调用都会读到实时配置；会话日志、投影 fold、格式校验全都不动。
 
-Turning the setting **off** yields `null`, which is the projection's own
-"no policy recorded" state. DSH then restricts explicit selection to the parent
-route — the plugin invents no new semantics.
+**关掉开关**返回 `null`，这正是 DSH 自己「没有记录策略」的状态，它会自动把显式选择限制为父会话路由——插件不发明新语义。
 
-## 2. The delegation tools do not know the route ids
+## 二、派发工具不知道路由 id
 
-The `provider` and `model` parameters of `subagent` are free-form strings. A
-model that guesses a plausible id — `openai` where the profile registers
-`codex`, say — learns the mistake only from the rejection raised after the call.
+`subagent` 的 `provider` 和 `model` 是自由字符串。模型猜一个看起来合理的 id（比如 profile 里注册的是 `codex`，它猜成 `openai`），只有调用被拒之后才知道错。
 
-`tools.schemas()` re-projects every visible definition on each call, so wrapping
-it appends a discovery hint to `subagent` and `subagent_fork` only:
+`tools.schemas()` 每次调用都会重新投影所有工具定义，所以包一层只在 `subagent` 和 `subagent_fork` 的描述后追加一句提示：
 
-> Before passing `provider` or `model`, call `list_subagent_models` … and copy
-> an exact id from its reply. Those ids are profile-specific: the provider may
-> not be named after the vendor, so do not infer one from a model name.
+> 传 `provider` 或 `model` 之前，先调 `list_subagent_models`……并从它的回复里复制精确 id。这些 id 是随 profile 变的：provider 未必按厂商命名，所以别从模型名去推。
 
-The hint never names a concrete provider, so it survives swapping the
-subscription plugin.
+提示里不写任何具体 provider 名，所以换掉订阅插件也依然有效。
 
-## What this plugin does not do
+## 它不做什么
 
-- It writes no Session events and changes no Session log.
-- It registers no tools.
-- It adds no system-prompt section.
-- It reads the preference from the existing `subagentModelSelection` Host
-  service rather than keeping a copy, so the Settings card stays the single
-  source of truth.
-- If DSH renames `cellFor` or `schemas`, the plugin detects the mismatch, logs
-  why it is inactive, and changes nothing.
+- 不写会话事件，不改会话日志。
+- 不注册工具。
+- 不加系统提示词。
+- 白名单直接读现有的 `subagentModelSelection` 服务，不留副本，设置页始终是唯一事实来源。
+- 如果 DSH 改了 `cellFor` 或 `schemas` 的名字，插件会检测到不匹配、在日志里说明原因，然后什么都不做。
 
-## How the patching stays safe
+## 补丁如何保证安全
 
-Both patches are reference-counted. During HMR the incoming fiber mounts before
-the outgoing one disposes, so two instances legitimately overlap; each holds a
-reference and the original method is restored only when the last one releases.
-Without the count, the first disposal would strip the patch while the survivor
-still believed it was installed.
+两个补丁都做了引用计数。HMR 时新 fiber 先挂载、旧 fiber 后卸载，两个实例会短暂并存；各自持有一个引用，**最后一个释放时才恢复原方法**。
 
-Both patches are owned by one effect, so disposal releases them in reverse order
-and never leaves a half-patched prototype.
+如果没有计数，第一次卸载就会剥掉补丁，而存活的实例仍以为自己装好了——实时读取会静默失效，直到下次重启。
 
-## Limits that remain
+两个补丁由同一个 effect 管理，卸载时按相反顺序释放，不会留下半打过补丁的原型。
 
-- Turning the setting **off** stops granting authorization; it does not erase a
-  list already written into an old Session's log. Those Sessions fall back to
-  the parent route, which is DSH's own meaning of "no policy".
-- An enabled but empty allowlist grants nothing.
+## 仍然存在的限制
 
-## Install
+- **关掉开关**只是停止授予新授权，不会擦掉旧会话日志里已经写下的列表。那些会话会回落到父路由，也就是 DSH 自己「无策略」的含义。
+- 开关开着但白名单为空，等于什么都不授予。
+
+## 安装
 
 ```sh
-dsh plugin --profile desktop add <this package>
+dsh plugin --profile desktop add github:xiaoni0v0/dsh-subagent-model-live-policy
 ```
 
-Or from a GitHub checkout:
+装完重载或重启 DSH 生效。
+
+## 测试
+
+测试用的是当前安装里真实的 `SessionProjectionRegistry`，所以覆盖的就是工具真正走的那条读路径。共 34 项。
 
 ```sh
-dsh plugin --profile desktop add github:<owner>/<repo>
+ELECTRON_RUN_AS_NODE=1 "<DSH 可执行文件>" test.mjs
 ```
 
-## Test
-
-The suite uses the real `SessionProjectionRegistry` from the running
-installation, so it covers the same read path the tools use.
-
-```sh
-ELECTRON_RUN_AS_NODE=1 "<DSH executable>" test.mjs
-```
-
-## License
+## 许可证
 
 MIT
