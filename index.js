@@ -41,10 +41,9 @@ const PATCH_MARK = Symbol.for('dsh.subagent-model-live-policy')
 export const name = 'subagent-model-live-policy'
 
 /**
- * The registry whose read path is patched. `tools` is required so the schema
- * hint installs only once both services exist, rather than racing them.
+ * The registry whose read path is patched.
  */
-export const inject = ['sessionProjections', 'tools']
+export const inject = ['sessionProjections']
 
 /**
  * Install one prototype method patch, reference-counted.
@@ -140,121 +139,22 @@ function installLiveRead(ctx, release) {
   return { live: true, reason: 'installed' }
 }
 
-/** Marks a schemas() projection that already carries the delegation hint. */
-const SCHEMAS_MARK = Symbol.for('dsh.subagent-model-live-policy.schemas')
-
-/** Tool names whose model-facing description gains the discovery hint. */
-const DELEGATION_TOOLS = new Set(['subagent', 'subagent_fork'])
-
 /**
- * The sentence appended to a delegation tool's description.
- *
- * The tool's own `provider`/`model` parameters are free-form strings, so a
- * model that guesses a plausible-but-wrong id (for example `openai` where this
- * profile registers `codex`) only learns the mistake from the rejection the
- * runtime raises after the call. Naming the discovery tool here — on the tool
- * it is needed for — is what stops the guessing.
- */
-const DISCOVERY_HINT = ' Before passing `provider` or `model`, call `list_subagent_models`'
-  + ' (no arguments for the authorized providers, then `provider` for its models) and copy an'
-  + ' exact id from its reply. Those ids are profile-specific: the provider may not be named'
-  + ' after the vendor, so do not infer one from a model name. Omitting all three route fields'
-  + ' always works and inherits the parent route.'
-
-/**
- * Append the discovery hint to a delegation tool's description, once.
- * Works on a registered ToolDefinition and on a projected ToolSchema alike:
- * both carry `name` and `description`, and neither needs anything else touched.
- * @param entry - definition or projected schema.
- * @returns the entry, possibly with an amended description.
- */
-function withDiscoveryHint(entry) {
-  if (!DELEGATION_TOOLS.has(entry?.name)) return entry
-  if (typeof entry.description !== 'string' || entry.description.includes('list_subagent_models')) {
-    return entry
-  }
-  return { ...entry, description: entry.description + DISCOVERY_HINT }
-}
-
-/**
- * Teach the delegation tools to discover routes before guessing them.
- *
- * Two methods have to be wrapped, because DSH derives the model-facing list from
- * one of them depending on the executor:
- *
- *  - `definitions()` feeds `executor.describe()`, which the native executor turns
- *    into schemas with its own `projectToolSchema` call. This is what the model
- *    actually sees on a stock profile, and it never reaches `schemas()`.
- *  - `schemas()` is the projection PTC and the Cordis inspect surface read.
- *
- * Wrapping only `schemas()` looked correct through an inspect query while the
- * model still saw the stock wording. Both are wrapped now.
- *
- * `definitions()` returns a fresh array of shared definition objects on every
- * call, so replacing elements with `{ ...entry, description }` leaves the
- * registry's stored definitions — and the `view()` identity checks in
- * `resolve()` — untouched.
- * @param ctx - plugin context carrying the tool registry.
- * @param release - installs one counted patch and returns its release.
- * @returns whether the projection is now hinted, plus a diagnostic.
- */
-function installDiscoveryHint(ctx, release) {
-  const tools = ctx.get('tools')
-  if (tools === undefined || tools === null) {
-    return { hinted: false, reason: 'the tools service is unavailable' }
-  }
-  const proto = Object.getPrototypeOf(tools)
-  if (proto === null) {
-    return { hinted: false, reason: 'the tool registry has no prototype' }
-  }
-  const wrap = (method) => {
-    if (!Object.hasOwn(proto, method)) return false
-    release(patchProto(proto, method, (original) => function patched(scope, toolSet) {
-      const list = original.call(this, scope, toolSet)
-      return Array.isArray(list) ? list.map(withDiscoveryHint) : list
-    }))
-    return true
-  }
-  const definitions = wrap('definitions')
-  const schemas = wrap('schemas')
-  if (!definitions && !schemas) {
-    return { hinted: false, reason: 'the tool registry owns neither definitions nor schemas' }
-  }
-  return {
-    hinted: true,
-    reason: definitions && schemas ? 'installed on definitions and schemas'
-      : definitions ? 'installed on definitions only' : 'installed on schemas only',
-  }
-}
-
-/**
- * Mount the live read path and the delegation discovery hint.
- *
- * Both patches are owned by one effect so a disposal releases them in reverse
- * order and leaves no half-patched prototype behind.
+ * Mount the live read path.
  * @param ctx - plugin context.
  */
 export function apply(ctx) {
   const releases = []
-  const release = (fn) => { releases.push(fn) }
-  ctx.effect(() => () => {
-    for (const fn of releases.splice(0).reverse()) fn()
-  }, 'subagent-model-live-policy: patches')
-
-  const result = installLiveRead(ctx, release)
+  const result = installLiveRead(ctx, (fn) => { releases.push(fn) })
   if (result.live) {
     ctx.logger.info('subagent-model-live-policy: the subagent allowlist is read live from Settings (%s)', result.reason)
   } else {
     ctx.logger.warn(
-      'subagent-model-live-policy: allowlist is not live — %s. Sessions keep the allowlist recorded when they were created.',
+      'subagent-model-live-policy: not active — %s. Sessions keep the allowlist recorded when they were created.',
       result.reason,
     )
   }
-  const hint = installDiscoveryHint(ctx, release)
-  if (!hint.hinted) {
-    ctx.logger.warn(
-      'subagent-model-live-policy: delegation tools keep their stock description — %s',
-      hint.reason,
-    )
-  }
+  ctx.effect(() => () => {
+    for (const fn of releases.splice(0).reverse()) fn()
+  }, 'subagent-model-live-policy: patch')
 }

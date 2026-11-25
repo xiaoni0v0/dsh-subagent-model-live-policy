@@ -83,44 +83,13 @@ function freshOtherDefinition() {
 }
 
 /**
- * A stand-in for the real tool registry. It mirrors the two methods DSH derives
- * the model-facing list from:
- *
- *  - `definitions()` returns a fresh array of the shared definition objects.
- *  - `schemas()` projects those definitions, like `projectToolSchema`.
- *
- * `describe()` mirrors the native executor's own path, which projects the
- * definitions it is handed rather than calling `schemas()`.
- */
-function FakeToolRegistry() {
-  this.visible = []
-}
-FakeToolRegistry.prototype.register = function register(definition) {
-  this.visible.push(definition)
-  return () => {
-    const index = this.visible.indexOf(definition)
-    if (index >= 0) this.visible.splice(index, 1)
-  }
-}
-FakeToolRegistry.prototype.definitions = function definitions() {
-  return [...this.visible]
-}
-FakeToolRegistry.prototype.schemas = function schemas() {
-  return this.definitions().map(({ name, description, parameters }) => ({ name, description, parameters }))
-}
-FakeToolRegistry.prototype.describe = function describe(list) {
-  return { schemas: list.map(({ name, description, parameters }) => ({ name, description, parameters })) }
-}
-
-/**
  * Mount the plugin over a genuine registry.
  */
-async function harness({ service, session, tools }) {
+async function harness({ service, session }) {
   const ctx = new Context()
   ctx.provide('sessions', { list: () => (session === undefined ? [] : [session]) })
   // The registry is a Service: constructing it provides `sessionProjections`.
   const registry = new SessionProjectionRegistry(ctx)
-  ctx.provide('tools', tools ?? new FakeToolRegistry())
   if (service !== undefined) ctx.provide('subagentModelSelection', service)
   const policyHandle = await registry.register(freshPolicyDefinition())
   const otherHandle = await registry.register(freshOtherDefinition())
@@ -242,84 +211,11 @@ async function mountPlugin(ctx) {
   check('the patch mark is gone', proto[Symbol.for('dsh.subagent-model-live-policy')] === undefined)
 }
 
-// ---- 10: the delegation tools learn to discover routes first ------------
+// ---- 10: two mounted instances share one patch, and the last release wins --
 {
-  const tools = new FakeToolRegistry()
-  tools.visible.push(
-    { name: 'subagent', description: 'Delegate a self-contained task.', parameters: { type: 'object' } },
-    { name: 'subagent_fork', description: 'Delegate with this conversation.', parameters: { type: 'object' } },
-    { name: 'read', description: 'Read a file.', parameters: { type: 'object' } },
-  )
-  const { ctx } = await harness({ service: policyService(true, [{ provider: 'xai', model: 'grok-4.7' }]), tools })
-  await mountPlugin(ctx)
-  const schemas = tools.schemas()
-  const byName = new Map(schemas.map(schema => [schema.name, schema]))
-  check('subagent names the discovery tool', byName.get('subagent').description.includes('list_subagent_models'))
-  check('subagent_fork names the discovery tool', byName.get('subagent_fork').description.includes('list_subagent_models'))
-  check('the original description is preserved', byName.get('subagent').description.startsWith('Delegate a self-contained task.'))
-  check('unrelated tools are untouched', byName.get('read').description === 'Read a file.')
-  check('the hint discourages guessing the vendor name', byName.get('subagent').description.includes('not be named after the vendor'))
-  check('the hint names the always-safe omission', byName.get('subagent').description.includes('Omitting all three route fields'))
-  await ctx.fiber.dispose()
-}
-
-// ---- 10b: the native executor path sees the hint too -------------------
-{
-  // The stock native executor builds the model-facing list from
-  // `definitions()`, never from `schemas()`; wrapping only `schemas()` left the
-  // model with the stock wording while an inspect query looked correct.
-  const tools = new FakeToolRegistry()
-  tools.visible.push(
-    { name: 'subagent', description: 'Delegate a self-contained task.', parameters: { type: 'object' } },
-    { name: 'read', description: 'Read a file.', parameters: { type: 'object' } },
-  )
-  const { ctx } = await harness({ service: policyService(true, [{ provider: 'xai', model: 'grok-4.7' }]), tools })
-  await mountPlugin(ctx)
-
-  const viaNative = tools.describe(tools.definitions())
-  const byName = new Map(viaNative.schemas.map(schema => [schema.name, schema]))
-  check('the native executor path carries the hint', byName.get('subagent').description.includes('list_subagent_models'))
-  check('the native path leaves other tools alone', byName.get('read').description === 'Read a file.')
-
-  // The registered definitions must stay pristine: `resolve()` compares them by
-  // identity against `view()`, so mutating them in place would break admission.
-  const registered = tools.visible.find(definition => definition.name === 'subagent')
-  check('the stored definition is not mutated', registered.description === 'Delegate a self-contained task.')
-  await ctx.fiber.dispose()
-}
-
-// ---- 11: the hint is applied once, not per call ------------------------
-{
-  const tools = new FakeToolRegistry()
-  tools.visible.push({ name: 'subagent', description: 'Delegate.', parameters: { type: 'object' } })
-  const { ctx } = await harness({ service: policyService(true, [{ provider: 'xai', model: 'grok-4.7' }]), tools })
-  await mountPlugin(ctx)
-  const first = tools.schemas()[0].description
-  const second = tools.schemas()[0].description
-  check('repeated projections do not stack the hint', first === second)
-  check('the hint appears exactly once', first.split('list_subagent_models').length - 1 === 1, `${first.split('list_subagent_models').length - 1} occurrences`)
-  await ctx.fiber.dispose()
-}
-
-// ---- 12: unloading restores the stock schemas -------------------------
-{
-  const tools = new FakeToolRegistry()
-  tools.visible.push({ name: 'subagent', description: 'Delegate.', parameters: { type: 'object' } })
-  const { ctx } = await harness({ service: policyService(true, [{ provider: 'xai', model: 'grok-4.7' }]), tools })
-  const fiber = await mountPlugin(ctx)
-  await fiber.dispose()
-  await new Promise(resolve => setTimeout(resolve, 60))
-  check('disposing restores the stock description', tools.schemas()[0].description === 'Delegate.')
-  check('the schemas mark is gone', Object.getPrototypeOf(tools)[Symbol.for('dsh.subagent-model-live-policy')] === undefined)
-}
-
-// ---- 13: two mounted instances share one patch, and the last release wins --
-{
-  const tools = new FakeToolRegistry()
-  tools.visible.push({ name: 'subagent', description: 'Delegate.', parameters: { type: 'object' } })
-  const session = fakeSession('s13', [{ type: POLICY_EVENT, data: { allowedModels: [{ provider: 'old', model: 'm' }] } }])
+  const session = fakeSession('s10', [{ type: POLICY_EVENT, data: { allowedModels: [{ provider: 'old', model: 'm' }] } }])
   const { ctx, registry, policyHandle } = await harness({
-    service: policyService(true, [{ provider: 'xai', model: 'grok-4.7' }]), session, tools,
+    service: policyService(true, [{ provider: 'xai', model: 'grok-4.7' }]), session,
   })
   // Two fibers of the same plugin, as HMR briefly produces.
   const first = ctx.plugin(plugin)
@@ -331,18 +227,16 @@ async function mountPlugin(ctx) {
   check('both instances share one counted patch', entry?.refs === 2, `refs=${entry?.refs}`)
   check('the read path is live with both mounted', policyHandle.stateOf(session)?.[0]?.provider === 'xai', JSON.stringify(policyHandle.stateOf(session)))
 
-  // Disposing one must leave the other working — the bug the counter fixes.
+  // Disposing one must leave the other working: the bug the counter fixes.
   await first.dispose()
   await new Promise(resolve => setTimeout(resolve, 80))
   check('one disposal keeps the patch alive for the survivor', policyHandle.stateOf(session)?.[0]?.provider === 'xai', JSON.stringify(policyHandle.stateOf(session)))
   check('the survivor still holds a reference', Object.getPrototypeOf(registry)[Symbol.for('dsh.subagent-model-live-policy')]?.refs === 1)
-  check('the hint survives too', tools.schemas()[0].description.includes('list_subagent_models'))
 
   await second.dispose()
   await new Promise(resolve => setTimeout(resolve, 80))
   check('the last disposal restores the recorded policy', policyHandle.stateOf(session)?.[0]?.provider === 'old', JSON.stringify(policyHandle.stateOf(session)))
   check('the mark is gone after the last release', Object.getPrototypeOf(registry)[Symbol.for('dsh.subagent-model-live-policy')] === undefined)
-  check('the stock description is back', tools.schemas()[0].description === 'Delegate.')
 }
 
 for (const { label, ok, detail } of results) {

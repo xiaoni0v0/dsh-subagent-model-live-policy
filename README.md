@@ -1,6 +1,6 @@
 # dsh-subagent-model-live-policy
 
-让 subagent 的模型白名单实时生效，同时让派发工具知道先去查清单。
+让 subagent 的模型白名单实时生效。
 
 ## 设置改了，旧会话不认
 
@@ -25,49 +25,23 @@ stateOf: session => this.cellFor(registration, session).state
 关掉开关时返回 `null`，也就是 DSH 自己「没有记录策略」的状态，它会自动把显式
 选择限制为父会话路由。
 
-## 派发工具不知道路由 id
-
-`subagent` 的 `provider` 和 `model` 是自由字符串。模型猜一个看着合理的 id
-（profile 里注册的是 `codex`，它猜成 `openai`），要等调用被拒才知道错。
-
-要改两个方法，因为 DSH 按执行器不同从不同地方取模型看到的工具列表：
-
-- `definitions()` 喂给 `executor.describe()`，native 执行器自己再调
-  `projectToolSchema`。默认配置下模型看到的就是这一条路，它不经过 `schemas()`。
-- `schemas()` 是 PTC 和 Cordis 检查接口读的那条。
-
-只包 `schemas()` 的时候，用检查接口查出来是对的，模型那边却还是原话。现在两个都包。
-
-`definitions()` 每次返回新数组，元素是和注册表共享的 definition 对象，所以替换成
-`{ ...entry, description }` 不会动到注册表里存的定义，也不会影响 `resolve()` 里
-按身份比较 `view()` 的那些判断。
-
-追加的那句话是：
-
-> 传 `provider` 或 `model` 之前，先调 `list_subagent_models`，从回复里复制精确
-> id。这些 id 随 profile 变：provider 未必按厂商命名，别从模型名去推。
-
-句子里没有具体 provider 名，换掉订阅插件也还成立。
-
 ## 它不做什么
 
-不写会话事件，不改会话日志，不注册工具，不加系统提示词。
+不写会话事件，不改会话日志，不注册工具，不加系统提示词，不改任何工具的描述。
 
 白名单直接读现有的 `subagentModelSelection` 服务，不留副本，设置页始终是唯一
 来源。
 
-如果 DSH 改了 `cellFor`、`definitions` 或 `schemas` 的名字，插件会发现对不上，
-在日志里说明原因，然后什么都不做。
+如果 DSH 改了 `cellFor` 的名字，插件会发现对不上，在日志里说明原因，然后什么都
+不做。
 
 ## 补丁怎么保证不出乱子
 
-两个补丁都做了引用计数。HMR 时新 fiber 先挂载、旧 fiber 后卸载，会有两个实例
-并存；各自持一个引用，最后一个释放时才恢复原方法。
+补丁做了引用计数。HMR 时新 fiber 先挂载、旧 fiber 后卸载，会有两个实例并存；
+各自持一个引用，最后一个释放时才恢复原方法。
 
 没有计数的话，第一次卸载就把补丁剥掉了，活着的实例还以为自己装好了，实时读取
 会静默失效，直到下次重启。
-
-所有补丁挂在同一个 effect 上，卸载时按相反顺序释放，不会留下半打过补丁的原型。
 
 ## 还有什么限制
 
@@ -87,7 +61,7 @@ dsh plugin --profile desktop add github:xiaoni0v0/dsh-subagent-model-live-policy
 ## 测试
 
 用的是当前安装里真实的 `SessionProjectionRegistry`，覆盖的就是工具真正走的那条
-读路径。共 37 项。
+读路径。共 22 项。
 
 ```sh
 ELECTRON_RUN_AS_NODE=1 "<DSH 可执行文件>" test.mjs
